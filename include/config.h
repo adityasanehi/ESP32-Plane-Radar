@@ -59,6 +59,17 @@ constexpr float kAdsbFetchRadiusScale = 1.0f;
 /** false = hide aircraft with alt_baro "ground"; true = show them too. */
 constexpr bool kAdsbShowGroundAircraft = false;
 
+/** New-aircraft info card: default seconds on screen (0 = off). Changeable in
+ *  the web portal's Setup page; kFlightCardMaxSec caps that field. */
+constexpr unsigned kFlightCardDefaultSec = 10;
+constexpr unsigned kFlightCardMaxSec = 60;
+/** An aircraft unseen for this long counts as "new" again. */
+constexpr unsigned long kFlightCardForgetMs = 30UL * 60UL * 1000UL;
+/** Logos dimmer than this (mean linear luminance, 0-1) get a white disc so they
+ *  stay visible on black. 0.12 catches Lufthansa/IndiGo/Qatar/Cathay navy-ish
+ *  marks; raise it if dark logos still disappear on your panel. */
+constexpr float kLogoDarkLuminance = 0.12f;
+
 // --- UI colors (RGB565) — status screens ---
 constexpr uint16_t kColorBlack = 0x0000;
 constexpr uint16_t kColorYellow = 0xFFE0;

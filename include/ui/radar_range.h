@@ -36,8 +36,13 @@ constexpr size_t kRangePresetCount =
 
 /** Load saved range and distance units from flash. Call once after boot. */
 void rangeInit();
-/** Cycle preset and save to flash. */
+/** Cycle preset and save to flash (also drops a custom range). */
 void rangeNext();
+/** Custom range from the web portal: km shown on ring 3 (kMinCustomRangeKm to
+ *  kMaxCustomRangeKm). Invalid text keeps the current range. */
+constexpr float kMinCustomRangeKm = 2.0f;
+constexpr float kMaxCustomRangeKm = 50.0f;
+void saveRangeKmFromPortal(const char* value);
 const RangePreset& rangeCurrent();
 uint8_t rangeIndex();
 /** ADSB fetch radius (km): scaled to screen edge so beyond-ring dots have data. */
@@ -48,6 +53,16 @@ bool showRunways();
 /** WiFi portal checkbox: "T" = miles, otherwise km. */
 void saveMilesFromPortal(const char* checkbox_value);
 void saveRunwaysFromPortal(const char* checkbox_value);
+/** Radar aircraft icon size setting 1-3 (1 = original triangle footprint)
+ *  and the matching draw scale. Saved in flash. */
+uint8_t iconSize();
+float iconScale();
+void saveIconSizeFromPortal(const char* value);
+/** Info card duration in ms (0 = cards off). Saved in flash. */
+unsigned long cardShowMs();
+unsigned cardShowSeconds();
+/** Portal number field; invalid text keeps the current value. */
+void saveCardSecondsFromPortal(const char* value);
 void formatRing3Label(char* buf, size_t len, float ring3_km, bool use_miles);
 void formatCurrentRing3Label(char* buf, size_t len);
 /** Reset distance units to km (e.g. with WiFi credential wipe). */

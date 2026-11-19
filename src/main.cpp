@@ -8,6 +8,7 @@
 #include "config.h"
 #include "hardware/display.h"
 #include "services/adsb_client.h"
+#include "services/log_buffer.h"
 #include "services/radar_location.h"
 #include "services/wifi_setup.h"
 #include "ui/radar_display.h"
@@ -45,7 +46,12 @@ void onRangeTap() {
 void handleBootButton() {
   bootButtonPollLongPress();
   if (bootButtonConsumeTap()) {
-    onRangeTap();
+    services::adsb::FlightCard card;
+    if (services::adsb::currentCard(&card)) {
+      services::adsb::dismissCard();  // first tap closes the info card
+    } else {
+      onRangeTap();
+    }
   }
 }
 
@@ -59,6 +65,7 @@ void adsbFetchTask(void*) {
       services::adsb::fetchUpdate(services::location::lat(),
                                   services::location::lon(),
                                   ui::radar::fetchRadiusKm());
+      services::adsb::processNewAircraft();
     }
     vTaskDelay(pdMS_TO_TICKS(config::kAdsbFetchIntervalMs));
   }
@@ -96,7 +103,7 @@ void loop() {
 
   if (WiFi.status() != WL_CONNECTED) {
     if (g_radar_visible) {
-      Serial.println("WiFi lost — will reconnect");
+      services::log::logf("wifi: lost connection, reconnecting");
       g_radar_visible = false;
     }
 
@@ -109,6 +116,8 @@ void loop() {
         millis() - g_last_reconnect_ms >= config::kWifiReconnectIntervalMs) {
       g_last_reconnect_ms = millis();
       if (wifiReconnect()) {
+        services::log::logf("wifi: reconnected to %s, RSSI %d dBm",
+                            WiFi.SSID().c_str(), WiFi.RSSI());
         g_wifi_down_since = 0;
         showRadarIfConnected();
       }
@@ -122,6 +131,8 @@ void loop() {
       // its own task (adsbFetchTask).
       g_last_redraw_ms = millis();
       ui::radarDisplayRefreshAircraft();
+    } else {
+      ui::radarDisplayAnimate();
     }
   }
 

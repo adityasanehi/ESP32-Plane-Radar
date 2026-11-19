@@ -3,6 +3,8 @@
 #include <WiFi.h>
 #include <WiFiManager.h>
 
+#include "services/log_buffer.h"
+
 #include <cstdio>
 #include <cstring>
 
@@ -81,6 +83,21 @@ char s_miles_checkbox_attrs[32] = "type=\"checkbox\"";
 WiFiManagerParameter s_param_miles("use_miles", "Display distances in miles", "T", 2,
                                    s_miles_checkbox_attrs, WFM_LABEL_AFTER);
 
+char s_card_secs_value[4] = "10";
+WiFiManagerParameter s_param_card_secs(
+    "card_secs", "New-aircraft card duration (seconds, 0 = off)", "10", 3,
+    " type=\"number\" min=\"0\" max=\"60\" step=\"1\"");
+
+char s_icon_size_value[3] = "2";
+WiFiManagerParameter s_param_icon_size(
+    "icon_size", "Aircraft icon size (1 = small, 2 = medium, 3 = large)", "2", 2,
+    " type=\"number\" min=\"1\" max=\"3\" step=\"1\"");
+
+char s_range_km_value[8] = "10";
+WiFiManagerParameter s_param_range_km(
+    "range_km", "Radar range: km at the 3rd ring (2-50; BOOT tap cycles 5/10/15/25)",
+    "10", 6, " type=\"number\" min=\"2\" max=\"50\" step=\"1\"");
+
 char s_runways_checkbox_attrs[32] = "type=\"checkbox\"";
 WiFiManagerParameter s_param_runways("show_runways", "Show airport runways", "T", 2,
                                      s_runways_checkbox_attrs, WFM_LABEL_AFTER);
@@ -98,6 +115,15 @@ void refreshPortalParamValues() {
   snprintf(s_runways_checkbox_attrs, sizeof(s_runways_checkbox_attrs),
            "type=\"checkbox\"%s", ui::radar::showRunways() ? " checked" : "");
   s_param_runways.setValue("T", 2);
+  snprintf(s_card_secs_value, sizeof(s_card_secs_value), "%u",
+           ui::radar::cardShowSeconds());
+  s_param_card_secs.setValue(s_card_secs_value, 3);
+  snprintf(s_icon_size_value, sizeof(s_icon_size_value), "%u",
+           ui::radar::iconSize());
+  s_param_icon_size.setValue(s_icon_size_value, 2);
+  snprintf(s_range_km_value, sizeof(s_range_km_value), "%g",
+           ui::radar::rangeCurrent().ring3_km);
+  s_param_range_km.setValue(s_range_km_value, 6);
 }
 
 void onPortalParamsSaved() {
@@ -107,6 +133,9 @@ void onPortalParamsSaved() {
   }
   ui::radar::saveMilesFromPortal(s_param_miles.getValue());
   ui::radar::saveRunwaysFromPortal(s_param_runways.getValue());
+  ui::radar::saveCardSecondsFromPortal(s_param_card_secs.getValue());
+  ui::radar::saveIconSizeFromPortal(s_param_icon_size.getValue());
+  ui::radar::saveRangeKmFromPortal(s_param_range_km.getValue());
 
   refreshPortalParamValues();
 }
@@ -117,6 +146,9 @@ void attachPortalParams(WiFiManager& wm) {
   wm.addParameter(&s_param_lon);
   wm.addParameter(&s_param_miles);
   wm.addParameter(&s_param_runways);
+  wm.addParameter(&s_param_range_km);
+  wm.addParameter(&s_param_icon_size);
+  wm.addParameter(&s_param_card_secs);
   wm.setSaveParamsCallback(onPortalParamsSaved);
 }
 
@@ -227,6 +259,17 @@ void ensureWifiManager() {
                            IPAddress(255, 255, 255, 0));
   s_wm.setHostname(config::kPortalHostname);
   s_wm.setAPCallback(onConfigPortalApStarted);
+  // "param" adds a Setup button for location / units / runways / card time.
+  static std::vector<const char*> menu = {"wifi", "param", "info",
+                                          "exit", "sep",   "update"};
+  s_wm.setMenu(menu);
+  // Extra page on the portal's web server: recent log lines, no USB needed.
+  s_wm.setWebServerCallback([] {
+    s_wm.server->on("/log", [] {
+      s_wm.server->send(200, "text/plain; charset=utf-8",
+                        services::log::dump());
+    });
+  });
   attachPortalParams(s_wm);
   s_wm_configured = true;
 }

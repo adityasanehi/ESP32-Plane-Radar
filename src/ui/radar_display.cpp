@@ -11,6 +11,7 @@
 #include "hardware/display.h"
 #include "hardware/display_font.h"
 #include "services/adsb_client.h"
+#include "services/log_buffer.h"
 #include "services/radar_location.h"
 #include "ui/radar_range.h"
 #include "ui/radar_theme.h"
@@ -52,6 +53,7 @@ int s_scale_label_h = 0;
 
 lgfx::LovyanGFX* s_draw = &tft;
 LGFX_Sprite s_frame(&tft);
+services::adsb::Aircraft s_planes[services::adsb::kMaxAircraft];
 bool s_frame_ready = false;
 
 class DrawScope {
@@ -239,10 +241,17 @@ void extrapolatedLatLon(const services::adsb::Aircraft& plane,
   *lon = plane.lon + (dist_km * sinf(rad)) / kKmPerDeg;
 }
 
+/** How far the icon reaches from its center (px), for ring and tag spacing. */
+int iconInsetPx() {
+  return static_cast<int>(lroundf((radar::kAircraftNoseLenPx +
+                                   radar::kAircraftTailHalfPx) *
+                                  radar::iconScale())) + 1;
+}
+
 float innerRingMaxKm() {
   const float outer_km = radar::rangeCurrent().outer_km;
   return outer_km * (static_cast<float>(radar::kGridOuterRadius -
-                                       radar::kAircraftInsideRingInsetPx) /
+                                       iconInsetPx()) /
                      static_cast<float>(radar::kGridOuterRadius));
 }
 
@@ -260,6 +269,351 @@ void latLonToScreen(float lat, float lon, int* out_x, int* out_y) {
   *out_y = radar::kCenterY - static_cast<int>(lroundf(dy_km * px_per_km));
 }
 
+// --- New-aircraft info card -------------------------------------------------
+
+#define EMBED_FONT(name)                                                     \
+  extern "C" const uint8_t _binary_data_fonts_##name##_vlw_start[] asm(      \
+      "_binary_data_fonts_" #name "_vlw_start");                             \
+  extern "C" const uint8_t _binary_data_fonts_##name##_vlw_end[] asm(        \
+      "_binary_data_fonts_" #name "_vlw_end");                               \
+  EmbeddedVlw s_font_##name(_binary_data_fonts_##name##_vlw_start,           \
+                            _binary_data_fonts_##name##_vlw_end);
+
+// Barlow Semi Condensed, pre-rendered at exact pixel sizes (scripts/make_vlw.py).
+EMBED_FONT(card_bold_26)  // airport codes
+EMBED_FONT(card_bold_20)  // flight number, badge fallback
+EMBED_FONT(card_bold_13)  // stat values
+EMBED_FONT(card_bold_9)   // stat labels
+EMBED_FONT(card_body_12)  // airline, cities, aircraft (Latin-1 for accents)
+
+/** Card colors are pre-swapped like the aircraft red: this panel shows R/B
+ *  exchanged (kDisplayRgbOrder), so logical colors must be flipped. */
+constexpr uint16_t cardColor(uint8_t r, uint8_t g, uint8_t b) {
+  return config::kDisplayRgbOrder ? lgfx::color565(b, g, r)
+                                  : lgfx::color565(r, g, b);
+}
+constexpr uint16_t kCardWhite = cardColor(255, 255, 255);
+constexpr uint16_t kCardMuted = cardColor(150, 160, 185);
+constexpr uint16_t kCardLabel = cardColor(120, 130, 160);
+constexpr uint16_t kCardDim = cardColor(70, 80, 110);
+constexpr uint16_t kCardAccent = cardColor(255, 180, 0);
+constexpr uint16_t kCardTeal = cardColor(110, 210, 230);
+constexpr uint16_t kCardRing = cardColor(40, 120, 140);
+constexpr uint16_t kCardBadgeEmpty = cardColor(30, 40, 70);
+
+constexpr uint16_t kCardBg = 0x0000;  // pure black: logos are blended onto it
+
+constexpr int kBadgeCx = 120;
+constexpr int kBadgeCy = 50;
+constexpr int kBadgeR = 25;   // white disc (dark logos) / fallback badge
+constexpr int kLogoPx = 34;   // logo square
+constexpr int kTileRadius = 6;  // rounded corners for square "tile" logos
+
+/** Centered text in font f, scaled down (to 70%) to fit max_w. */
+void cardText(EmbeddedVlw& f, const char* text, int x, int y, int max_w,
+              uint16_t color) {
+  if (text[0] == '\0') return;
+  const lgfx::IFont* font = f.get();
+  s_draw->setFont(font != nullptr ? font : &fonts::FreeSansBold9pt7b);
+  s_draw->setTextSize(1.0f);
+  const int w = s_draw->textWidth(text);
+  if (w > max_w) {
+    s_draw->setTextSize(std::max(0.7f, static_cast<float>(max_w) / w));
+  }
+  s_draw->setTextDatum(textdatum_t::middle_center);
+  s_draw->setTextColor(color);  // transparent: AA blends over what's drawn
+  s_draw->drawString(text, x, y);
+  s_draw->setTextSize(1.0f);
+}
+
+/** Small top-view airliner pointing right, ~2*s px long. */
+void drawPlaneIcon(int x, int y, float s, uint16_t color) {
+  auto px = [&](float v) { return x + static_cast<int>(lroundf(v * s)); };
+  auto py = [&](float v) { return y + static_cast<int>(lroundf(v * s)); };
+  s_draw->drawWideLine(px(-0.85f), y, px(1.0f), y, std::max(1.0f, s * 0.14f),
+                       color);
+  s_draw->fillTriangle(px(0.3f), y, px(-0.3f), py(-0.65f), px(-0.3f), py(0.65f),
+                       color);
+  s_draw->fillTriangle(px(-0.6f), y, px(-0.9f), py(-0.38f), px(-0.9f),
+                       py(0.38f), color);
+}
+
+/** Flat-earth distance in "degrees", fine for a progress ratio. */
+float flatDist(float lat1, float lon1, float lat2, float lon2) {
+  const float k = cosf((lat1 + lat2) * 0.5f * 0.01745329f);
+  const float dx = (lon2 - lon1) * k;
+  const float dy = lat2 - lat1;
+  return sqrtf(dx * dx + dy * dy);
+}
+
+/** "12450 ft" -> "12,450"; "GND" stays; empty -> "--". */
+void formatAltitude(const char* alt, char* out, size_t len) {
+  const bool numeric = (alt[0] >= '0' && alt[0] <= '9') || alt[0] == '-';
+  if (!numeric) {
+    snprintf(out, len, "%s", alt[0] ? alt : "--");
+    return;
+  }
+  const int ft = atoi(alt);
+  if (ft >= 1000) {
+    snprintf(out, len, "%d,%03d", ft / 1000, ft % 1000);
+  } else {
+    snprintf(out, len, "%d", ft);
+  }
+}
+
+// Logo: decoded once per card into a 16-bit sprite. It's drawn into the 8-bit
+// frame (so it never flashes missing) and then again straight to the panel at
+// full color, since the RGB332 frame would band the gradients.
+LGFX_Sprite s_logo(&tft);
+uint32_t s_logo_hex = 0;
+bool s_logo_ok = false;
+bool s_logo_on_white = false;  // dark logo: drawn on a white disc
+
+/** Coverage (0-1) of pixel (x, y) inside a w x h rounded rect of radius r. */
+float roundedCoverage(int x, int y, int w, int h, int r) {
+  const float cx = x + 0.5f < r ? r : (x + 0.5f > w - r ? w - r : x + 0.5f);
+  const float cy = y + 0.5f < r ? r : (y + 0.5f > h - r ? h - r : y + 0.5f);
+  const float dx = x + 0.5f - cx;
+  const float dy = y + 0.5f - cy;
+  return std::max(0.0f, std::min(1.0f, r + 0.5f - sqrtf(dx * dx + dy * dy)));
+}
+
+void decodeLogo(const uint8_t* jpg_black, size_t black_len,
+                const uint8_t* jpg_white, size_t white_len) {
+  // The proxy already composited the logo onto black and onto white at 34 px;
+  // per pixel, their difference gives alpha.
+  LGFX_Sprite on_black(&tft);
+  LGFX_Sprite on_white(&tft);
+  on_black.setColorDepth(16);
+  on_white.setColorDepth(16);
+  if (!on_black.createSprite(kLogoPx, kLogoPx) ||
+      !on_white.createSprite(kLogoPx, kLogoPx)) {
+    services::log::logf("logo: sprite alloc failed");
+    return;
+  }
+  on_black.fillScreen(TFT_BLACK);
+  on_white.fillScreen(TFT_WHITE);
+  if (!on_black.drawJpg(jpg_black, black_len, 0, 0) ||
+      !on_white.drawJpg(jpg_white, white_len, 0, 0)) {
+    services::log::logf("logo: JPEG decode failed");
+    return;
+  }
+
+  auto alphaAt = [&](int x, int y) {
+    const auto b = on_black.readPixelRGB(x, y);
+    const auto wh = on_white.readPixelRGB(x, y);
+    const int diff = (wh.R8() - b.R8()) + (wh.G8() - b.G8()) + (wh.B8() - b.B8());
+    return std::max(0.0f, std::min(1.0f, 1.0f - diff / (3.0f * 255.0f)));
+  };
+
+  // Mean linear luminance of the opaque logo pixels -> too dark for black?
+  float lum = 0.0f;
+  int opaque = 0;
+  for (int y = 0; y < kLogoPx; ++y) {
+    for (int x = 0; x < kLogoPx; ++x) {
+      const float a = alphaAt(x, y);
+      if (a <= 0.5f) continue;
+      const auto c = on_black.readPixelRGB(x, y);
+      const float r = std::min(1.0f, c.R8() / 255.0f / a);
+      const float g = std::min(1.0f, c.G8() / 255.0f / a);
+      const float b = std::min(1.0f, c.B8() / 255.0f / a);
+      lum += 0.2126f * r * r + 0.7152f * g * g + 0.0722f * b * b;
+      ++opaque;
+    }
+  }
+  s_logo_on_white = opaque > 0 && lum / opaque < config::kLogoDarkLuminance;
+
+  // Solid corners = a square tile logo (Air India, easyJet): round them off.
+  // Find the logo's bounds first: fit=contain letterboxes non-square logos.
+  int x0 = kLogoPx, y0 = kLogoPx, x1 = -1, y1 = -1;
+  for (int y = 0; y < kLogoPx; ++y) {
+    for (int x = 0; x < kLogoPx; ++x) {
+      if (alphaAt(x, y) > 0.5f) {
+        x0 = std::min(x0, x);
+        y0 = std::min(y0, y);
+        x1 = std::max(x1, x);
+        y1 = std::max(y1, y);
+      }
+    }
+  }
+  // 0.85 not 0.9: JPEG ringing softens the black/white difference at edges.
+  const bool tile = x1 > x0 && alphaAt(x0, y0) > 0.85f &&
+                    alphaAt(x1, y0) > 0.85f && alphaAt(x0, y1) > 0.85f &&
+                    alphaAt(x1, y1) > 0.85f;
+
+  if (s_logo.width() == 0) {
+    s_logo.setColorDepth(16);
+    if (!s_logo.createSprite(kLogoPx, kLogoPx)) return;
+  }
+  LGFX_Sprite& src = s_logo_on_white ? on_white : on_black;
+  for (int y = 0; y < kLogoPx; ++y) {
+    for (int x = 0; x < kLogoPx; ++x) {
+      const auto c = src.readPixelRGB(x, y);
+      // Tiles fade to the background outside their rounded corners.
+      const float k = tile && !s_logo_on_white &&
+                              x >= x0 && x <= x1 && y >= y0 && y <= y1
+                          ? roundedCoverage(x - x0, y - y0, x1 - x0 + 1,
+                                            y1 - y0 + 1, kTileRadius)
+                          : 1.0f;
+      s_logo.drawPixel(x, y, cardColor(c.R8() * k, c.G8() * k, c.B8() * k));
+    }
+  }
+  s_logo_ok = true;
+}
+
+/** Allocate card fonts and the logo sprite once at boot, before the heap gets
+ *  churned: allocating them mid-run fragments the blocks TLS needs. */
+void initCardResources() {
+  static bool done = false;
+  if (done) return;
+  done = true;
+  for (EmbeddedVlw* f : {&s_font_card_bold_26, &s_font_card_bold_20,
+                         &s_font_card_bold_13, &s_font_card_bold_9,
+                         &s_font_card_body_12}) {
+    f->get();
+  }
+  s_logo.setColorDepth(16);
+  s_logo.createSprite(kLogoPx, kLogoPx);
+}
+
+void refreshLogo(uint32_t hex) {
+  if (hex == s_logo_hex) return;
+  s_logo_hex = hex;
+  s_logo_ok = false;
+  services::adsb::withCardLogo(decodeLogo);
+}
+
+void drawBadge(const services::adsb::FlightCard& card) {
+  if (s_logo_ok) {
+    if (s_logo_on_white) {
+      s_draw->fillSmoothCircle(kBadgeCx, kBadgeCy, kBadgeR, cardColor(255, 255, 255));
+    }
+    s_logo.pushSprite(s_draw, kBadgeCx - kLogoPx / 2, kBadgeCy - kLogoPx / 2);
+    return;
+  }
+  // No logo: airline code, or a plane for private traffic.
+  s_draw->fillSmoothCircle(kBadgeCx, kBadgeCy, kBadgeR, kCardBadgeEmpty);
+  const char* code = card.airline_iata[0] ? card.airline_iata : card.airline_icao;
+  if (code[0] != '\0') {
+    cardText(s_font_card_bold_20, code, kBadgeCx, kBadgeCy, 42, kCardWhite);
+  } else {
+    drawPlaneIcon(kBadgeCx, kBadgeCy, 13.0f, kCardMuted);
+  }
+}
+
+// Countdown ring state, so radarDisplayAnimate() can shave it between frames.
+constexpr int kRingOuter = radar::kCenterX - 1;
+constexpr int kRingInner = radar::kCenterX - 3;
+uint32_t s_ring_hex = 0;   // card whose ring is on the panel (0 = none)
+float s_ring_end = -90.0f;  // end angle currently drawn
+
+float ringEndAngle(const services::adsb::FlightCard& card) {
+  const float left = 1.0f - static_cast<float>(millis() - card.shown_ms) /
+                                static_cast<float>(radar::cardShowMs());
+  return -90.0f + 360.0f * std::max(0.0f, left);
+}
+
+const char* kCompass[] = {"N", "NE", "E", "SE", "S", "SW", "W", "NW"};
+
+/**
+ * Full-screen card for a newly seen aircraft: logo badge, flight, route with
+ * live progress, airframe, then live altitude / speed / distance.
+ */
+void drawFlightCard(const services::adsb::FlightCard& card,
+                    const services::adsb::Aircraft* live, unsigned long base_ms) {
+  const int cx = radar::kCenterX;
+  s_draw->fillScreen(kCardBg);
+
+  // Countdown ring: shrinks clockwise from 12 o'clock as the card times out.
+  // Full frames come at 4 Hz; radarDisplayAnimate() shaves it in between.
+  s_ring_end = ringEndAngle(card);
+  if (s_ring_end > -90.0f) {
+    s_draw->fillArc(cx, radar::kCenterY, kRingOuter, kRingInner, -90.0f,
+                    s_ring_end, kCardRing);
+  }
+
+  drawBadge(card);
+  cardText(s_font_card_bold_20,
+           card.flight_iata[0] ? card.flight_iata : card.callsign, cx, 90, 190,
+           kCardWhite);
+  cardText(s_font_card_body_12, card.airline, cx, 108, 180, kCardMuted);
+
+  float lat = 0.0f;
+  float lon = 0.0f;
+  if (live != nullptr) extrapolatedLatLon(*live, base_ms, &lat, &lon);
+
+  // adsbdb routes come from a callsign database and can be stale (flight
+  // numbers get reused). Hide a route the plane is nowhere near: going via its
+  // position must not add more than ~30% (+1 deg slack near the airports).
+  bool route_ok = card.orig[0] && card.dest[0];
+  float progress = 0.5f;
+  if (route_ok && card.has_coords && live != nullptr) {
+    const float done = flatDist(card.orig_lat, card.orig_lon, lat, lon);
+    const float togo = flatDist(lat, lon, card.dest_lat, card.dest_lon);
+    const float direct =
+        flatDist(card.orig_lat, card.orig_lon, card.dest_lat, card.dest_lon);
+    route_ok = done + togo <= direct * 1.3f + 1.0f;
+    if (done + togo > 0.0f) progress = done / (done + togo);
+  }
+
+  if (route_ok) {
+    constexpr int kY = 134;
+    constexpr int kX0 = 93;
+    constexpr int kX1 = 147;
+    cardText(s_font_card_bold_26, card.orig, 62, kY, 70, kCardWhite);
+    cardText(s_font_card_bold_26, card.dest, 178, kY, 70, kCardWhite);
+    const int px = kX0 + static_cast<int>((kX1 - kX0) * progress);
+    for (int x = kX0; x < kX1; x += 5) {
+      s_draw->drawFastHLine(x, kY, 2, kCardDim);
+    }
+    s_draw->fillRect(kX0, kY - 1, px - kX0, 2, kCardAccent);
+    drawPlaneIcon(px, kY, 7.0f, kCardAccent);
+    cardText(s_font_card_body_12, card.orig_city, 62, 154, 84, kCardTeal);
+    cardText(s_font_card_body_12, card.dest_city, 178, 154, 84, kCardTeal);
+  } else {
+    cardText(s_font_card_body_12, "Route not available", cx, 136, 180,
+             kCardLabel);
+  }
+
+  const char* model = card.model[0] ? card.model : (live ? live->type : "");
+  char line[64];
+  if (card.reg[0] != '\0' && model[0] != '\0') {
+    snprintf(line, sizeof(line), "%s  \xC2\xB7  %s", model, card.reg);  // middot
+  } else {
+    snprintf(line, sizeof(line), "%s%s", model, card.reg);
+  }
+  cardText(s_font_card_body_12, line, cx, 174, 196, kCardWhite);
+
+  if (live == nullptr) return;  // left the feed; keep the static info up
+  float dx_km = 0.0f;
+  float dy_km = 0.0f;
+  float dist_km = 0.0f;
+  offsetKmFromCenter(lat, lon, &dx_km, &dy_km, &dist_km);
+  float bearing = atan2f(dx_km, dy_km) * 57.2957795f;
+  if (bearing < 0.0f) bearing += 360.0f;
+  const bool miles = radar::useMiles();
+
+  char alt[12];
+  char spd[8];
+  char dist[16];
+  formatAltitude(live->alt, alt, sizeof(alt));
+  snprintf(spd, sizeof(spd), "%d", static_cast<int>(lroundf(live->gs_knots)));
+  snprintf(dist, sizeof(dist), "%.1f %s", miles ? dist_km / 1.609f : dist_km,
+           kCompass[static_cast<int>((bearing + 22.5f) / 45.0f) % 8]);
+  const struct {
+    int x;
+    const char* label;
+    const char* value;
+    uint16_t color;
+  } stats[] = {{76, "ALT FT", alt, kCardAccent},
+               {120, "KT", spd, kCardWhite},
+               {164, miles ? "MI" : "KM", dist, kCardWhite}};
+  for (const auto& st : stats) {
+    cardText(s_font_card_bold_9, st.label, st.x, 191, 44, kCardLabel);
+    cardText(s_font_card_bold_13, st.value, st.x, 204, 46, st.color);
+  }
+}
+
 bool isInsideOuterRingKm(float dist_km) { return dist_km <= innerRingMaxKm(); }
 
 int distSqFromCenter(int x, int y) {
@@ -269,7 +623,7 @@ int distSqFromCenter(int x, int y) {
 }
 
 bool isInsideOuterRing(int x, int y) {
-  const int max_r = radar::kGridOuterRadius - radar::kAircraftInsideRingInsetPx;
+  const int max_r = radar::kGridOuterRadius - iconInsetPx();
   return distSqFromCenter(x, y) <= max_r * max_r;
 }
 
@@ -350,30 +704,44 @@ int speedLineLengthPx(float gs_knots) {
 void noseTip(int cx, int cy, float heading_deg, int* tip_x, int* tip_y) {
   constexpr float kDegToRad = 0.01745329252f;
   const float rad = heading_deg * kDegToRad;
-  *tip_x = cx + static_cast<int>(lroundf(sinf(rad) * radar::kAircraftNoseLenPx));
-  *tip_y = cy - static_cast<int>(lroundf(cosf(rad) * radar::kAircraftNoseLenPx));
+  const float nose = radar::kAircraftNoseLenPx * radar::iconScale();
+  *tip_x = cx + static_cast<int>(lroundf(sinf(rad) * nose));
+  *tip_y = cy - static_cast<int>(lroundf(cosf(rad) * nose));
 }
 
-void drawHeadingTriangle(int cx, int cy, float heading_deg, uint16_t color) {
+/**
+ * Top-view airliner silhouette rotated to heading. Coordinates are in "triangle
+ * units": nose at +8 forward, wings +-4.5 wide, so icon size 1 keeps the old
+ * triangle's footprint; radar::iconScale() enlarges it.
+ */
+void drawPlaneSymbol(int cx, int cy, float heading_deg, uint16_t color) {
   constexpr float kDegToRad = 0.01745329252f;
-  const float rad = heading_deg * kDegToRad;
-  const float sin_h = sinf(rad);
-  const float cos_h = cosf(rad);
-
-  int tip_x = 0;
-  int tip_y = 0;
-  noseTip(cx, cy, heading_deg, &tip_x, &tip_y);
-
-  const int base_x =
-      cx - static_cast<int>(lroundf(sin_h * static_cast<float>(radar::kAircraftTailLenPx)));
-  const int base_y =
-      cy + static_cast<int>(lroundf(cos_h * static_cast<float>(radar::kAircraftTailLenPx)));
-
-  const int wing_x = static_cast<int>(lroundf(cos_h * radar::kAircraftTailHalfPx));
-  const int wing_y = static_cast<int>(lroundf(sin_h * radar::kAircraftTailHalfPx));
-
-  s_draw->fillTriangle(tip_x, tip_y, base_x + wing_x, base_y + wing_y,
-                       base_x - wing_x, base_y - wing_y, color);
+  const float sc = radar::iconScale();
+  const float fx = sinf(heading_deg * kDegToRad);   // forward, screen x
+  const float fy = -cosf(heading_deg * kDegToRad);  // forward, screen y
+  // (f, s) = (forward, starboard) -> screen; starboard = forward rotated 90 cw.
+  auto pt = [&](float f, float st, int* x, int* y) {
+    *x = cx + static_cast<int>(lroundf((f * fx - st * fy) * sc));
+    *y = cy + static_cast<int>(lroundf((f * fy + st * fx) * sc));
+  };
+  int x0, y0, x1, y1, x2, y2;
+  // Fuselage.
+  pt(8.0f, 0.0f, &x0, &y0);
+  pt(-4.5f, 0.0f, &x1, &y1);
+  s_draw->drawWideLine(x0, y0, x1, y1, std::max(1.0f, 0.9f * sc), color);
+  // Swept wings and tailplane, one triangle per side.
+  const float shapes[][6] = {
+      {2.5f, 0.0f, -1.8f, 4.5f, -0.8f, 0.0f},    // wing: root LE, tip, root TE
+      {-3.0f, 0.0f, -5.0f, 2.4f, -4.6f, 0.0f},   // tailplane
+  };
+  for (const auto& t : shapes) {
+    for (float side : {1.0f, -1.0f}) {
+      pt(t[0], t[1] * side, &x0, &y0);
+      pt(t[2], t[3] * side, &x1, &y1);
+      pt(t[4], t[5] * side, &x2, &y2);
+      s_draw->fillTriangle(x0, y0, x1, y1, x2, y2, color);
+    }
+  }
 }
 
 void drawSpeedVector(int cx, int cy, float heading_deg, float track_deg,
@@ -440,8 +808,7 @@ void drawAircraftTag(int x, int y, const services::adsb::Aircraft& plane) {
   const int block_h = line_h * 3;
   int ly = y - block_h / 2;
 
-  const int symbol_half =
-      radar::kAircraftNoseLenPx + radar::kAircraftTailHalfPx;
+  const int symbol_half = iconInsetPx() - 1;
   // West (left): tag toward center on the right; east (right): tag on the left.
   const bool tag_on_right = x < radar::kCenterX;
   int anchor_x = 0;
@@ -515,7 +882,7 @@ void drawAircraft() {
   initLabelMetrics();
 
   // Snapshot under the adsb lock (the fetch may run on another thread).
-  static services::adsb::Aircraft planes[services::adsb::kMaxAircraft];
+  services::adsb::Aircraft* planes = s_planes;
   unsigned long base_ms = 0;
   const size_t n = services::adsb::snapshotAircraft(
       planes, services::adsb::kMaxAircraft, &base_ms);
@@ -571,7 +938,7 @@ void drawAircraft() {
     const int y = items[d].y;
     drawSpeedVector(x, y, planes[i].nose_deg, planes[i].track_deg,
                     planes[i].gs_knots, radar::kColorTrackVector);
-    drawHeadingTriangle(x, y, planes[i].nose_deg, radar::kColorAircraft);
+    drawPlaneSymbol(x, y, planes[i].nose_deg, radar::kColorAircraft);
   }
   for (size_t d = 0; d < draw_count; ++d) {
     const size_t i = items[d].index;
@@ -709,6 +1076,28 @@ bool ensureFrameSprite() {
 // sprite, then blit it to the panel in a single pushSprite. Because the panel
 // is updated in one pass, labels never show an erase/redraw gap — no flicker.
 void renderFrame() {
+  services::adsb::FlightCard card;
+  if (services::adsb::currentCard(&card)) {
+    const DrawScope scope(s_frame);
+    initLabelMetrics();
+    unsigned long base_ms = 0;
+    const size_t n = services::adsb::snapshotAircraft(
+        s_planes, services::adsb::kMaxAircraft, &base_ms);
+    const services::adsb::Aircraft* live = nullptr;
+    for (size_t i = 0; i < n; ++i) {
+      if (s_planes[i].hex == card.hex) live = &s_planes[i];
+    }
+    refreshLogo(card.hex);
+    drawFlightCard(card, live, base_ms);
+    s_frame.pushSprite(0, 0);
+    s_ring_hex = card.hex;
+    if (s_logo_ok) {
+      s_logo.pushSprite(kBadgeCx - kLogoPx / 2, kBadgeCy - kLogoPx / 2);
+    }
+    tft.setTextDatum(textdatum_t::top_left);
+    return;
+  }
+  s_ring_hex = 0;
   drawStaticGrid(s_frame);  // opens its own DrawScope(s_frame)
   {
     const DrawScope scope(s_frame);
@@ -723,6 +1112,7 @@ void renderFrame() {
 void radarDisplayDraw() {
   initPalette();
   initLabelMetrics();
+  initCardResources();
 
   if (ensureFrameSprite()) {
     renderFrame();
@@ -734,6 +1124,18 @@ void radarDisplayDraw() {
   drawStaticGrid(tft);
   drawAircraft();
   tft.setTextDatum(textdatum_t::top_left);
+}
+
+void radarDisplayAnimate() {
+  if (s_ring_hex == 0) return;
+  services::adsb::FlightCard card;
+  if (!services::adsb::currentCard(&card) || card.hex != s_ring_hex) return;
+  const float end = ringEndAngle(card);
+  if (s_ring_end - end < 0.5f) return;  // < half a degree: nothing visible
+  // Erase only the expired sliver straight on the panel (a few hundred px).
+  tft.fillArc(radar::kCenterX, radar::kCenterY, kRingOuter, kRingInner, end,
+              s_ring_end, kCardBg);
+  s_ring_end = end;
 }
 
 void radarDisplayRefreshAircraft() {

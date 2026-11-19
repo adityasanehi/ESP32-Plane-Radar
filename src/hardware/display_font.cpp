@@ -8,43 +8,38 @@ extern const uint8_t _binary_data_ui_font_vlw_start[] asm(
 extern const uint8_t _binary_data_ui_font_vlw_end[] asm("_binary_data_ui_font_vlw_end");
 }
 
+const lgfx::IFont* EmbeddedVlw::get() {
+  if (!tried_) {
+    tried_ = true;
+    data_.set(start_, static_cast<uint32_t>(end_ - start_));
+    ok_ = end_ > start_ && font_.loadFont(&data_);
+  }
+  return ok_ ? &font_ : nullptr;
+}
+
 namespace {
 
-bool s_vlw_loaded = false;
-
-const uint8_t* vlwData() { return _binary_data_ui_font_vlw_start; }
-
-size_t vlwDataLen() {
-  return static_cast<size_t>(_binary_data_ui_font_vlw_end -
-                               _binary_data_ui_font_vlw_start);
-}
-
-bool vlwActiveOn(const lgfx::LGFXBase& gfx) {
-  const lgfx::IFont* font = gfx.getFont();
-  return font != nullptr && font->getType() == lgfx::IFont::font_type_t::ft_vlw;
-}
+EmbeddedVlw s_ui_font(_binary_data_ui_font_vlw_start, _binary_data_ui_font_vlw_end);
 
 }  // namespace
 
 bool displayFontInit() {
-  s_vlw_loaded = vlwDataLen() > 0 &&
-                 tft.loadFont(vlwData(), lgfx::IFont::font_type_t::ft_vlw);
-  if (!s_vlw_loaded) {
+  if (s_ui_font.get() == nullptr) {
     Serial.println("Smooth font load failed — using bitmap fallback");
-  }
-  return s_vlw_loaded;
-}
-
-bool displayFontIsSmooth() { return s_vlw_loaded; }
-
-bool displayFontEnsureLoaded(lgfx::LGFXBase& gfx) {
-  if (!s_vlw_loaded) {
     return false;
   }
-  if (vlwActiveOn(gfx)) {
-    return true;
+  tft.setFont(s_ui_font.get());
+  return true;
+}
+
+bool displayFontIsSmooth() { return s_ui_font.get() != nullptr; }
+
+bool displayFontEnsureLoaded(lgfx::LGFXBase& gfx) {
+  if (s_ui_font.get() == nullptr) {
+    return false;
   }
-  return gfx.loadFont(vlwData(), lgfx::IFont::font_type_t::ft_vlw);
+  gfx.setFont(s_ui_font.get());
+  return true;
 }
 
 void displayFontSetSmoothSize(lgfx::LGFXBase& gfx, float size) {
