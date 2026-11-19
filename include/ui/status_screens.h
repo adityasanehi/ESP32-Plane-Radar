@@ -3,6 +3,7 @@
 void statusScreenPortal();
 void statusScreenConnectFailed();
 void statusScreenWifiReset();
+void statusScreenUpdating();
 
 /** Saved-network connect animation (call Tick until connect finishes). */
 void statusScreenConnectingBegin(const char* ssid);

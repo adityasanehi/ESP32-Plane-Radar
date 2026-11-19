@@ -14,5 +14,9 @@ bool wifiBootButtonPressed();
 void bootButtonInit();
 /** Latched short tap (survives blocking HTTP/display work). */
 bool bootButtonConsumeTap();
+
+/** True while a firmware upload (portal Update page) is in progress: radar
+ *  drawing and ADS-B fetches pause so the upload gets the CPU and heap. */
+bool otaInProgress();
 /** Call each loop iteration; triggers WiFi reset on long hold. */
 void bootButtonPollLongPress();

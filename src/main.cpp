@@ -61,11 +61,11 @@ void handleBootButton() {
 // lock; the render loop reads a snapshot.
 void adsbFetchTask(void*) {
   for (;;) {
-    if (WiFi.status() == WL_CONNECTED) {
+    if (WiFi.status() == WL_CONNECTED && !otaInProgress()) {
       services::adsb::fetchUpdate(services::location::lat(),
                                   services::location::lon(),
                                   ui::radar::fetchRadiusKm());
-      services::adsb::processNewAircraft();
+      if (!otaInProgress()) services::adsb::processNewAircraft();
     }
     vTaskDelay(pdMS_TO_TICKS(config::kAdsbFetchIntervalMs));
   }
@@ -97,9 +97,23 @@ void setup() {
   xTaskCreatePinnedToCore(adsbFetchTask, "adsb", 16384, nullptr, 1, nullptr, 0);
 }
 
+bool g_ota_was_active = false;
+
 void loop() {
   handleBootButton();
   wifiLoop();
+
+  // Firmware upload in progress: leave the CPU to the web server. If it ends
+  // without a reboot (failed), redraw the radar from scratch.
+  if (otaInProgress()) {
+    g_ota_was_active = true;
+    delay(1);
+    return;
+  }
+  if (g_ota_was_active) {
+    g_ota_was_active = false;
+    g_radar_visible = false;
+  }
 
   if (WiFi.status() != WL_CONNECTED) {
     if (g_radar_visible) {

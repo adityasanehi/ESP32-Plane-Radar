@@ -1,9 +1,11 @@
 #include "services/wifi_setup.h"
 
 #include <WiFi.h>
+#include <Update.h>
 #include <WiFiManager.h>
 
 #include "services/log_buffer.h"
+#include "ui/status_screens.h"
 
 #include <cstdio>
 #include <cstring>
@@ -62,6 +64,8 @@ constexpr char kWifiPrefsNamespace[] = "wifi";
 constexpr char kPrefsForcePortalKey[] = "portal";
 
 bool s_force_config_portal = false;
+volatile bool s_ota_active = false;
+unsigned long s_ota_started_ms = 0;
 WiFiManager s_wm;
 bool s_wm_configured = false;
 
@@ -259,6 +263,15 @@ void ensureWifiManager() {
                            IPAddress(255, 255, 255, 0));
   s_wm.setHostname(config::kPortalHostname);
   s_wm.setAPCallback(onConfigPortalApStarted);
+  // Runs on the loop task when an upload starts. WebServer drops an upload if
+  // it can't read for 5 s, and a TLS handshake in the fetch task can hog the
+  // single-core C3 that long -- so pause everything else first.
+  s_wm.setPreOtaUpdateCallback([] {
+    s_ota_active = true;
+    s_ota_started_ms = millis();
+    services::log::logf("ota: upload started, radar paused");
+    statusScreenUpdating();
+  });
   // "param" adds a Setup button for location / units / runways / card time.
   static std::vector<const char*> menu = {"wifi", "param", "info",
                                           "exit", "sep",   "update"};
@@ -432,6 +445,17 @@ bool wifiBootButtonPressed() {
 }
 
 void bootButtonInit() { initBootButton(); }
+
+bool otaInProgress() {
+  if (!s_ota_active) return false;
+  // Success reboots; a failed or abandoned upload must resume the radar.
+  if (!Update.isRunning() && millis() - s_ota_started_ms > 3000) {
+    s_ota_active = false;
+    services::log::logf("ota: upload ended without reboot, resuming");
+    return false;
+  }
+  return true;
+}
 
 bool bootButtonConsumeTap() {
   portENTER_CRITICAL(&s_boot_mux);

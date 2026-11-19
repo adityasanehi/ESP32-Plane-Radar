@@ -231,6 +231,15 @@ void statusScreenConnectFailed() {
                 sizeof(lines) / sizeof(lines[0]));
 }
 
+void statusScreenUpdating() {
+  const TextLine lines[] = {
+      {"Updating", 1.15f, &kPortalGfxTitle},
+      {"firmware...", 1.05f, &kPortalGfxBody},
+  };
+  drawTextBlock(config::kColorBlack, config::kTextOnBlack, lines,
+                sizeof(lines) / sizeof(lines[0]));
+}
+
 void statusScreenWifiReset() {
   const TextLine lines[] = {
       {"Wi-Fi reset", 1.15f, &kPortalGfxTitle},
