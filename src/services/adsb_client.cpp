@@ -8,6 +8,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -497,7 +498,12 @@ bool logoFor(const char* icao, LogoRef* out) {
  *  so names like "Citation Excel" keep their space). */
 void formatModel(const char* maker, const char* type, char* out, size_t len) {
   snprintf(out, len, "%s%s%s", maker, maker[0] ? " " : "", type);
-  char* sp = strchr(out + strlen(maker) + (maker[0] ? 1 : 0), ' ');
+  // maker is network data and may be longer than out: clamp the search start
+  // to what snprintf actually wrote.
+  const size_t written = strlen(out);
+  const size_t start =
+      std::min(written, strlen(maker) + (maker[0] ? 1 : 0));
+  char* sp = strchr(out + start, ' ');
   if (sp != nullptr && sp[1] >= '0' && sp[1] <= '9') *sp = '-';
 }
 
